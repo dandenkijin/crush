@@ -472,7 +472,8 @@
             "anthropic",
             "gemini",
             "azure",
-            "vertexai"
+            "vertexai",
+            "tabbyapi"
           ],
           "description": "Provider type that determines the API format",
           "default": "openai"
@@ -483,6 +484,11 @@
           "examples": [
             "$OPENAI_API_KEY"
           ]
+        },
+        "admin_api_key": {  
+          "type": "string",  
+          "description": "Admin API key for providers requiring dual authentication",  
+          "examples": ["$TABBY_ADMIN_API_KEY"]  
         },
         "oauth": {
           "$ref": "#/$defs/Token",

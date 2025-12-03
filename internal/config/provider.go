@@ -19,7 +19,6 @@ import (
 type ProviderClient interface {
 	GetProviders() ([]catwalk.Provider, error)
 }
-
 var (
 	providerOnce sync.Once
 	providerList []catwalk.Provider

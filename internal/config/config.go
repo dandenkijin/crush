@@ -92,9 +92,11 @@ type ProviderConfig struct {
 	// The provider's API endpoint.
 	BaseURL string `json:"base_url,omitempty" jsonschema:"description=Base URL for the provider's API,format=uri,example=https://api.openai.com/v1"`
 	// The provider type, e.g. "openai", "anthropic", etc. if empty it defaults to openai.
-	Type catwalk.Type `json:"type,omitempty" jsonschema:"description=Provider type that determines the API format,enum=openai,enum=openai-compat,enum=anthropic,enum=gemini,enum=azure,enum=vertexai,default=openai"`
+	Type catwalk.Type `json:"type,omitempty" jsonschema:"description=Provider type that determines the API format,enum=openai,enum=openai-compat,enum=anthropic,enum=gemini,enum=azure,enum=vertexai,enum=tabbyapi,default=openai"`
 	// The provider's API key.
 	APIKey string `json:"api_key,omitempty" jsonschema:"description=API key for authentication with the provider,example=$OPENAI_API_KEY"`
+	// The provider's admin API key (for tabbyapi) 
+	AdminAPIKey string `json:"admin_api_key,omitempty" jsonschema:"description=Admin API key for providers requiring dual authentication,example=$TABBY_ADMIN_API_KEY"`  
 	// OAuthToken for providers that use OAuth2 authentication.
 	OAuthToken *oauth.Token `json:"oauth,omitempty" jsonschema:"description=OAuth2 token for authentication with the provider"`
 	// Marks the provider as disabled.
@@ -693,6 +695,7 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 	testURL := ""
 	headers := make(map[string]string)
 	apiKey, _ := resolver.ResolveValue(c.APIKey)
+	adminAPIKey, _ := resolver.ResolveValue(c.AdminAPIKey)
 	switch c.Type {
 	case catwalk.TypeOpenAI, catwalk.TypeOpenAICompat, catwalk.TypeOpenRouter:
 		baseURL, _ := resolver.ResolveValue(c.BaseURL)
@@ -723,7 +726,16 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 			baseURL = "https://generativelanguage.googleapis.com"
 		}
 		testURL = baseURL + "/v1beta/models?key=" + url.QueryEscape(apiKey)
-	}
+	case catwalk.TypeTabbyAPI:
+		baseURL, _ := resolver.ResolveValue(c.BaseURL)
+		if baseURL == "" {
+			baseURL = "http://127.0.0.1:5000/v1"
+		}
+		headers["Authorization"] = "Bearer " + apiKey
+		if adminAPIKey != "" {
+			headers["X-Admin-Key"] = adminAPIKey
+		}
+		testURL = baseURL + "/models"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client := &http.Client{}
@@ -752,6 +764,8 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 		}
 	}
 	_ = b.Body.Close()
+	return nil
+	}
 	return nil
 }
 

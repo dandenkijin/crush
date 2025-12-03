@@ -262,6 +262,20 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 					return fmt.Errorf("bedrock provider only supports anthropic models for now, found: %s", model.ID)
 				}
 			}
+		case catwalk.InferenceTabbyAPI:
+			// TabbyAPI requires special handling for dual authentication
+			adminAPIKey, err := resolver.ResolveValue(config.AdminAPIKey)
+			if adminAPIKey == "" || err != nil {
+				if configExists {
+					slog.Warn("Skipping TabbyAPI provider due to missing admin API key", "provider", p.ID)
+					c.Providers.Del(string(p.ID))
+				}
+				continue
+			}
+			// Set admin API key for authentication
+			prepared.APIKey = adminAPIKey
+			// Add TabbyAPI specific headers
+			prepared.ExtraHeaders["X-API-Key"] = adminAPIKey
 		default:
 			// if the provider api or endpoint are missing we skip them
 			v, err := resolver.ResolveValue(p.APIKey)
