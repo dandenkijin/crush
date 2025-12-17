@@ -796,20 +796,9 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 		// Ensure baseURL doesn't end with /v1
 		baseURL = strings.TrimSuffix(baseURL, "/v1")
 		baseURL = strings.TrimSuffix(baseURL, "/")
-		testURL = baseURL + "/v1/models"
 
-		// Include both API key and admin key if available
-		if apiKey != "" {
-			headers["X-API-Key"] = apiKey
-		}
-		if adminAPIKey != "" {
-			headers["Authorization"] = "Bearer " + adminAPIKey
-		}
-
-		// Log the request details
-		slog.Debug("Testing TabbyAPI connection", "url", testURL, "headers", headers)
-
-		// Fetch models and update the provider configuration
+		// Fetch models and update the provider configuration. For model listing, TabbyAPI
+		// expects Authorization: Bearer <admin_api_key>.
 		slog.Debug("Fetching models for TabbyAPI", "baseURL", baseURL)
 		models, err := fetchTabbyAPIModels(baseURL, apiKey, adminAPIKey)
 		if err != nil {
@@ -820,36 +809,44 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 		// Update the provider's models
 		slog.Debug("Successfully fetched models for TabbyAPI", "count", len(models))
 		c.Models = models
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		client := &http.Client{}
-		req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
-		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
-		for k, v := range c.ExtraHeaders {
-			req.Header.Set(k, v)
-		}
-		b, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
-		}
-		if c.ID == string(catwalk.InferenceProviderZAI) {
-			if b.StatusCode == http.StatusUnauthorized {
-				// for z.ai just check if the http response is not 401
-				return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
-			}
-		} else {
-			if b.StatusCode != http.StatusOK {
-				return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
-			}
-		}
-		_ = b.Body.Close()
 		return nil
 	}
+
+	if testURL == "" {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	for k, v := range c.ExtraHeaders {
+		req.Header.Set(k, v)
+	}
+
+	b, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
+	}
+	defer b.Body.Close()
+
+	if c.ID == string(catwalk.InferenceProviderZAI) {
+		if b.StatusCode == http.StatusUnauthorized {
+			// for z.ai just check if the http response is not 401
+			return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+		}
+	} else {
+		if b.StatusCode != http.StatusOK {
+			return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+		}
+	}
+
 	return nil
 }
 

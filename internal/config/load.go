@@ -279,10 +279,9 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 				}
 				continue
 			}
-			// Set admin API key for authentication
-			prepared.APIKey = adminAPIKey
-			// Add TabbyAPI specific headers
-			prepared.ExtraHeaders["X-API-Key"] = adminAPIKey
+			// Keep APIKey as the normal API key (X-API-Key) and store admin key separately.
+			// TestConnection and request building resolve these values later.
+			prepared.AdminAPIKey = config.AdminAPIKey
 			// Explicitly set the type to ensure it's not treated as a custom provider
 			prepared.Type = catwalk.TypeTabbyAPI
 		default:
@@ -321,6 +320,9 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 				if err := providerConfig.TestConnection(resolver); err != nil {
 					slog.Warn("Failed to fetch models for TabbyAPI", "error", err, "provider", id)
 					c.Providers.Del(id)
+				} else {
+					// Persist fetched models back into the map.
+					c.Providers.Set(id, providerConfig)
 				}
 			}
 			continue
