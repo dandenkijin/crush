@@ -137,8 +137,15 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 	restore := PushPopCrushEnv()
 	defer restore()
 
+	// Add all known provider types to the knownProviderNames map
 	for _, p := range knownProviders {
 		knownProviderNames[string(p.ID)] = true
+		knownProviderNames[string(p.Type)] = true
+	}
+
+	for _, p := range knownProviders {
+		knownProviderNames[string(p.ID)] = true
+		knownProviderNames[string(p.Type)] = true
 		config, configExists := c.Providers.Get(string(p.ID))
 		// if the user configured a known provider we need to allow it to override a couple of parameters
 		if configExists {
@@ -276,6 +283,8 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 			prepared.APIKey = adminAPIKey
 			// Add TabbyAPI specific headers
 			prepared.ExtraHeaders["X-API-Key"] = adminAPIKey
+			// Explicitly set the type to ensure it's not treated as a custom provider
+			prepared.Type = catwalk.TypeTabbyAPI
 		default:
 			// if the provider api or endpoint are missing we skip them
 			v, err := resolver.ResolveValue(p.APIKey)
@@ -290,9 +299,30 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 		c.Providers.Set(string(p.ID), prepared)
 	}
 
+	// Add debug logging for known and current providers
+	var knownProviderList []string
+	for k := range knownProviderNames {
+		knownProviderList = append(knownProviderList, k)
+	}
+	slog.Debug("Known provider names", "providers", knownProviderList)
+
+	var currentProviders []string
+	for id, p := range c.Providers.Seq2() {
+		currentProviders = append(currentProviders, fmt.Sprintf("%s (type: %s, models: %d)", id, p.Type, len(p.Models)))
+	}
+	slog.Debug("Current providers before validation", "providers", currentProviders)
+
 	// validate the custom providers
 	for id, providerConfig := range c.Providers.Seq2() {
-		if knownProviderNames[id] {
+		// Skip known providers and TabbyAPI (which we handle specially)
+		if knownProviderNames[id] || providerConfig.Type == catwalk.TypeTabbyAPI {
+			// For TabbyAPI, we need to fetch models if not already done
+			if providerConfig.Type == catwalk.TypeTabbyAPI && len(providerConfig.Models) == 0 {
+				if err := providerConfig.TestConnection(resolver); err != nil {
+					slog.Warn("Failed to fetch models for TabbyAPI", "error", err, "provider", id)
+					c.Providers.Del(id)
+				}
+			}
 			continue
 		}
 

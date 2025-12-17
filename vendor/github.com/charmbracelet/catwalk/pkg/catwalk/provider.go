@@ -106,7 +106,7 @@ func KnownProviders() []InferenceProvider {
 }
 
 // KnownProviderTypes returns all the known inference providers types.
-func KnownProviderTypes() []Type {
+func KnownProviderTypes() [] Type {
 	return []Type{
 		TypeOpenAI,
 		TypeOpenAICompat,
@@ -116,5 +116,6 @@ func KnownProviderTypes() []Type {
 		TypeAzure,
 		TypeBedrock,
 		TypeVertexAI,
+		TypeTabbyAPI,
 	}
 }

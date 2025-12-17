@@ -3,7 +3,9 @@ package config
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -95,8 +97,8 @@ type ProviderConfig struct {
 	Type catwalk.Type `json:"type,omitempty" jsonschema:"description=Provider type that determines the API format,enum=openai,enum=openai-compat,enum=anthropic,enum=gemini,enum=azure,enum=vertexai,enum=tabbyapi,default=openai"`
 	// The provider's API key.
 	APIKey string `json:"api_key,omitempty" jsonschema:"description=API key for authentication with the provider,example=$OPENAI_API_KEY"`
-	// The provider's admin API key (for tabbyapi) 
-	AdminAPIKey string `json:"admin_api_key,omitempty" jsonschema:"description=Admin API key for providers requiring dual authentication,example=$TABBY_ADMIN_API_KEY"`  
+	// The provider's admin API key (for tabbyapi)
+	AdminAPIKey string `json:"admin_api_key,omitempty" jsonschema:"description=Admin API key for providers requiring dual authentication,example=$TABBY_ADMIN_API_KEY"`
 	// OAuthToken for providers that use OAuth2 authentication.
 	OAuthToken *oauth.Token `json:"oauth,omitempty" jsonschema:"description=OAuth2 token for authentication with the provider"`
 	// Marks the provider as disabled.
@@ -691,6 +693,66 @@ func (c *Config) Resolver() VariableResolver {
 	return c.resolver
 }
 
+// fetchTabbyAPIModels fetches the list of available models from a TabbyAPI endpoint
+func fetchTabbyAPIModels(baseURL, apiKey, adminAPIKey string) ([]catwalk.Model, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	// Ensure baseURL doesn't end with /v1
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	url := baseURL + "/v1/models"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// For model listing, only use the admin API key in the Authorization header
+	if adminAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+adminAPIKey)
+	}
+
+	slog.Debug("Making request to TabbyAPI", "url", url, "headers", req.Header)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch models: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	slog.Debug("TabbyAPI response", "status", resp.StatusCode, "body", string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d, response: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response according to the API documentation
+	var result struct {
+		Data []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name,omitempty"`
+			Description string `json:"description,omitempty"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	var models []catwalk.Model
+	for _, model := range result.Data {
+		modelName := model.Name
+		if modelName == "" {
+			modelName = model.ID
+		}
+		models = append(models, catwalk.Model{
+			ID:   model.ID,
+			Name: modelName,
+		})
+	}
+
+	slog.Debug("Successfully parsed TabbyAPI models", "count", len(models))
+	return models, nil
+}
+
 func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 	testURL := ""
 	headers := make(map[string]string)
@@ -729,42 +791,64 @@ func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {
 	case catwalk.TypeTabbyAPI:
 		baseURL, _ := resolver.ResolveValue(c.BaseURL)
 		if baseURL == "" {
-			baseURL = "http://127.0.0.1:5000/v1"
+			baseURL = "http://127.0.0.1:5000"
 		}
-		headers["Authorization"] = "Bearer " + apiKey
+		// Ensure baseURL doesn't end with /v1
+		baseURL = strings.TrimSuffix(baseURL, "/v1")
+		baseURL = strings.TrimSuffix(baseURL, "/")
+		testURL = baseURL + "/v1/models"
+
+		// Include both API key and admin key if available
+		if apiKey != "" {
+			headers["X-API-Key"] = apiKey
+		}
 		if adminAPIKey != "" {
-			headers["X-Admin-Key"] = adminAPIKey
+			headers["Authorization"] = "Bearer " + adminAPIKey
 		}
-		testURL = baseURL + "/models"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	client := &http.Client{}
-	req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range c.ExtraHeaders {
-		req.Header.Set(k, v)
-	}
-	b, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
-	}
-	if c.ID == string(catwalk.InferenceProviderZAI) {
-		if b.StatusCode == http.StatusUnauthorized {
-			// for z.ai just check if the http response is not 401
-			return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+
+		// Log the request details
+		slog.Debug("Testing TabbyAPI connection", "url", testURL, "headers", headers)
+
+		// Fetch models and update the provider configuration
+		slog.Debug("Fetching models for TabbyAPI", "baseURL", baseURL)
+		models, err := fetchTabbyAPIModels(baseURL, apiKey, adminAPIKey)
+		if err != nil {
+			slog.Error("Failed to fetch models for TabbyAPI", "error", err, "baseURL", baseURL)
+			return fmt.Errorf("failed to fetch models: %w", err)
 		}
-	} else {
-		if b.StatusCode != http.StatusOK {
-			return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+
+		// Update the provider's models
+		slog.Debug("Successfully fetched models for TabbyAPI", "count", len(models))
+		c.Models = models
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		client := &http.Client{}
+		req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
 		}
-	}
-	_ = b.Body.Close()
-	return nil
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		for k, v := range c.ExtraHeaders {
+			req.Header.Set(k, v)
+		}
+		b, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create request for provider %s: %w", c.ID, err)
+		}
+		if c.ID == string(catwalk.InferenceProviderZAI) {
+			if b.StatusCode == http.StatusUnauthorized {
+				// for z.ai just check if the http response is not 401
+				return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+			}
+		} else {
+			if b.StatusCode != http.StatusOK {
+				return fmt.Errorf("failed to connect to provider %s: %s", c.ID, b.Status)
+			}
+		}
+		_ = b.Body.Close()
+		return nil
 	}
 	return nil
 }
