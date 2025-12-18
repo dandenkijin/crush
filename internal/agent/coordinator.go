@@ -10,9 +10,11 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/catwalk/pkg/catwalk"
@@ -38,6 +40,57 @@ import (
 	openaisdk "github.com/openai/openai-go/v2/option"
 	"github.com/qjebbs/go-jsons"
 )
+
+func normalizeTabbyBaseURL(baseURL string) string {
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:5000"
+	}
+	return baseURL
+}
+
+func tabbyAPIEnsureModelLoaded(ctx context.Context, baseURL, apiKey, adminKey, modelName string) error {
+	baseURL = normalizeTabbyBaseURL(baseURL)
+
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
+	body, err := json.Marshal(map[string]any{
+		"model_name": modelName,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/model/load", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	if adminKey != "" {
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+	}
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("tabbyapi model load failed: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+
+	// Response is an SSE stream; drain until completion or timeout.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
 
 type Coordinator interface {
 	// INFO: (kujtim) this is not used yet we will use this when we have multiple agents
@@ -419,6 +472,14 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 	if !ok {
 		return Model{}, Model{}, errors.New("large model provider not configured")
 	}
+	if largeProviderCfg.Type == catwalk.TypeTabbyAPI {
+		apiKey, _ := c.cfg.Resolve(largeProviderCfg.APIKey)
+		adminKey, _ := c.cfg.Resolve(largeProviderCfg.AdminAPIKey)
+		baseURL, _ := c.cfg.Resolve(largeProviderCfg.BaseURL)
+		if err := tabbyAPIEnsureModelLoaded(ctx, baseURL, apiKey, adminKey, largeModelCfg.Model); err != nil {
+			return Model{}, Model{}, err
+		}
+	}
 
 	largeProvider, err := c.buildProvider(largeProviderCfg, largeModelCfg)
 	if err != nil {
@@ -428,6 +489,14 @@ func (c *coordinator) buildAgentModels(ctx context.Context) (Model, Model, error
 	smallProviderCfg, ok := c.cfg.Providers.Get(smallModelCfg.Provider)
 	if !ok {
 		return Model{}, Model{}, errors.New("large model provider not configured")
+	}
+	if smallProviderCfg.Type == catwalk.TypeTabbyAPI {
+		apiKey, _ := c.cfg.Resolve(smallProviderCfg.APIKey)
+		adminKey, _ := c.cfg.Resolve(smallProviderCfg.AdminAPIKey)
+		baseURL, _ := c.cfg.Resolve(smallProviderCfg.BaseURL)
+		if err := tabbyAPIEnsureModelLoaded(ctx, baseURL, apiKey, adminKey, smallModelCfg.Model); err != nil {
+			return Model{}, Model{}, err
+		}
 	}
 
 	smallProvider, err := c.buildProvider(smallProviderCfg, largeModelCfg)
@@ -695,6 +764,12 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 		return c.buildGoogleVertexProvider(headers, providerCfg.ExtraParams)
 	case openaicompat.Name:
 		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody)
+	case catwalk.TypeTabbyAPI:
+		baseURL = normalizeTabbyBaseURL(baseURL) + "/v1"
+		if apiKey != "" {
+			headers["X-API-Key"] = apiKey
+		}
+		return c.buildOpenaiCompatProvider(baseURL, "", headers, providerCfg.ExtraBody)
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}

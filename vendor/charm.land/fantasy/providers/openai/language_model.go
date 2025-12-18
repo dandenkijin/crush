@@ -266,6 +266,25 @@ func (o languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 		extraContent := o.extraContentFunc(choice)
 		content = append(content, extraContent...)
 	}
+
+	// Backward compatibility: some OpenAI-compatible APIs return legacy `function_call`
+	// instead of `tool_calls`.
+	if len(choice.Message.ToolCalls) == 0 {
+		var raw struct {
+			FunctionCall *struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function_call"`
+		}
+		if err := json.Unmarshal([]byte(choice.Message.RawJSON()), &raw); err == nil && raw.FunctionCall != nil && raw.FunctionCall.Name != "" {
+			content = append(content, fantasy.ToolCallContent{
+				ProviderExecuted: false,
+				ToolCallID:       uuid.NewString(),
+				ToolName:         raw.FunctionCall.Name,
+				Input:            raw.FunctionCall.Arguments,
+			})
+		}
+	}
 	for _, tc := range choice.Message.ToolCalls {
 		toolCallID := tc.ID
 		content = append(content, fantasy.ToolCallContent{
@@ -291,6 +310,13 @@ func (o languageModel) Generate(ctx context.Context, call fantasy.Call) (*fantas
 	mappedFinishReason := o.mapFinishReasonFunc(choice.FinishReason)
 	if len(choice.Message.ToolCalls) > 0 {
 		mappedFinishReason = fantasy.FinishReasonToolCalls
+	} else {
+		for _, c := range content {
+			if c.GetType() == fantasy.ContentTypeToolCall {
+				mappedFinishReason = fantasy.FinishReasonToolCalls
+				break
+			}
+		}
 	}
 	return &fantasy.Response{
 		Content:      content,
@@ -317,6 +343,8 @@ func (o languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 	stream := o.client.Chat.Completions.NewStreaming(ctx, *params)
 	isActiveText := false
 	toolCalls := make(map[int64]streamToolCall)
+	legacyToolCall := streamToolCall{}
+	legacyToolCallStarted := false
 
 	providerMetadata := fantasy.ProviderMetadata{
 		Name: &ProviderMetadata{},
@@ -473,6 +501,71 @@ func (o languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 							continue
 						}
 					}
+				default:
+					// Backward compatibility: some servers stream legacy `function_call` deltas.
+					var raw struct {
+						FunctionCall *struct {
+							Name      string `json:"name,omitempty"`
+							Arguments string `json:"arguments,omitempty"`
+						} `json:"function_call"`
+					}
+					if err := json.Unmarshal([]byte(choice.Delta.RawJSON()), &raw); err == nil && raw.FunctionCall != nil {
+						if isActiveText {
+							isActiveText = false
+							if !yield(fantasy.StreamPart{
+								Type: fantasy.StreamPartTypeTextEnd,
+								ID:   "0",
+							}) {
+								return
+							}
+						}
+
+						if !legacyToolCallStarted {
+							legacyToolCallStarted = true
+							legacyToolCall = streamToolCall{id: uuid.NewString()}
+							if raw.FunctionCall.Name != "" {
+								legacyToolCall.name = raw.FunctionCall.Name
+							}
+							if !yield(fantasy.StreamPart{
+								Type:         fantasy.StreamPartTypeToolInputStart,
+								ID:           legacyToolCall.id,
+								ToolCallName: legacyToolCall.name,
+							}) {
+								return
+							}
+						}
+
+						if raw.FunctionCall.Name != "" && legacyToolCall.name == "" {
+							legacyToolCall.name = raw.FunctionCall.Name
+						}
+						if raw.FunctionCall.Arguments != "" {
+							legacyToolCall.arguments += raw.FunctionCall.Arguments
+							if !yield(fantasy.StreamPart{
+								Type:  fantasy.StreamPartTypeToolInputDelta,
+								ID:    legacyToolCall.id,
+								Delta: raw.FunctionCall.Arguments,
+							}) {
+								return
+							}
+						}
+						if !legacyToolCall.hasFinished && xjson.IsValid(legacyToolCall.arguments) {
+							if !yield(fantasy.StreamPart{
+								Type: fantasy.StreamPartTypeToolInputEnd,
+								ID:   legacyToolCall.id,
+							}) {
+								return
+							}
+							if !yield(fantasy.StreamPart{
+								Type:          fantasy.StreamPartTypeToolCall,
+								ID:            legacyToolCall.id,
+								ToolCallName:  legacyToolCall.name,
+								ToolCallInput: legacyToolCall.arguments,
+							}) {
+								return
+							}
+							legacyToolCall.hasFinished = true
+						}
+					}
 				}
 
 				if o.streamExtraFunc != nil {
@@ -538,6 +631,9 @@ func (o languageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.S
 				if len(choice.Message.ToolCalls) > 0 {
 					mappedFinishReason = fantasy.FinishReasonToolCalls
 				}
+			}
+			if legacyToolCallStarted && legacyToolCall.hasFinished {
+				mappedFinishReason = fantasy.FinishReasonToolCalls
 			}
 			yield(fantasy.StreamPart{
 				Type:             fantasy.StreamPartTypeFinish,

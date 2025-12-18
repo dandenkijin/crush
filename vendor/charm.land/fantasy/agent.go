@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 )
 
 // StepResult represents the result of a single step in an agent execution.
@@ -1098,6 +1099,13 @@ func (a *agent) processStepStream(ctx context.Context, stream StreamResponse, op
 
 	activeToolCalls := make(map[string]*ToolCallContent)
 	activeTextContent := make(map[string]string)
+	type textStreamState struct {
+		pending    string
+		inToolCall bool
+		toolBuf    string
+	}
+	activeTextStreamState := make(map[string]*textStreamState)
+	toolCallSeq := 0
 	type reasoningContent struct {
 		content string
 		options ProviderMetadata
@@ -1126,6 +1134,7 @@ func (a *agent) processStepStream(ctx context.Context, stream StreamResponse, op
 
 		case StreamPartTypeTextStart:
 			activeTextContent[part.ID] = ""
+			activeTextStreamState[part.ID] = &textStreamState{}
 			if opts.OnTextStart != nil {
 				err := opts.OnTextStart(part.ID)
 				if err != nil {
@@ -1134,17 +1143,168 @@ func (a *agent) processStepStream(ctx context.Context, stream StreamResponse, op
 			}
 
 		case StreamPartTypeTextDelta:
-			if _, exists := activeTextContent[part.ID]; exists {
-				activeTextContent[part.ID] += part.Delta
+			state, ok := activeTextStreamState[part.ID]
+			if !ok {
+				state = &textStreamState{}
+				activeTextStreamState[part.ID] = state
 			}
-			if opts.OnTextDelta != nil {
-				err := opts.OnTextDelta(part.ID, part.Delta)
-				if err != nil {
-					return StepResult{}, false, err
+
+			emitTextDelta := func(delta string) error {
+				if delta == "" {
+					return nil
 				}
+				if _, exists := activeTextContent[part.ID]; exists {
+					activeTextContent[part.ID] += delta
+				}
+				if opts.OnTextDelta != nil {
+					return opts.OnTextDelta(part.ID, delta)
+				}
+				return nil
+			}
+
+			emitToolCall := func(name string, input string) error {
+				toolCallSeq++
+				toolID := fmt.Sprintf("toolcall-%d", toolCallSeq)
+
+				if opts.OnToolInputStart != nil {
+					if err := opts.OnToolInputStart(toolID, name); err != nil {
+						return err
+					}
+				}
+				if opts.OnToolInputDelta != nil {
+					if err := opts.OnToolInputDelta(toolID, input); err != nil {
+						return err
+					}
+				}
+				if opts.OnToolInputEnd != nil {
+					if err := opts.OnToolInputEnd(toolID); err != nil {
+						return err
+					}
+				}
+
+				toolCall := ToolCallContent{
+					ToolCallID:       toolID,
+					ToolName:         name,
+					Input:            input,
+					ProviderExecuted: false,
+				}
+				validatedToolCall := a.validateAndRepairToolCall(ctx, toolCall, a.settings.tools, a.settings.systemPrompt, nil, opts.RepairToolCall)
+				stepToolCalls = append(stepToolCalls, validatedToolCall)
+				stepContent = append(stepContent, validatedToolCall)
+				if opts.OnToolCall != nil {
+					if err := opts.OnToolCall(validatedToolCall); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+
+			// Parse and strip literal <tool_call>...</tool_call> blocks from the text stream.
+			const startTag = "<tool_call>"
+			const endTag = "</tool_call>"
+			buf := state.pending + part.Delta
+			state.pending = ""
+			for len(buf) > 0 {
+				if !state.inToolCall {
+					startIdx := strings.Index(buf, startTag)
+					if startIdx == -1 {
+						// Emit all safe text except a possible partial start tag suffix.
+						keep := 0
+						maxKeep := len(startTag) - 1
+						if maxKeep > len(buf) {
+							maxKeep = len(buf)
+						}
+						for k := maxKeep; k > 0; k-- {
+							if strings.HasSuffix(buf, startTag[:k]) {
+								keep = k
+								break
+							}
+						}
+						safe := buf
+						if keep > 0 {
+							safe = buf[:len(buf)-keep]
+							state.pending = buf[len(buf)-keep:]
+						}
+						if err := emitTextDelta(safe); err != nil {
+							return StepResult{}, false, err
+						}
+						buf = ""
+						continue
+					}
+
+					if err := emitTextDelta(buf[:startIdx]); err != nil {
+						return StepResult{}, false, err
+					}
+					buf = buf[startIdx+len(startTag):]
+					state.inToolCall = true
+					state.toolBuf = ""
+					continue
+				}
+
+				// In a tool call
+				endIdx := strings.Index(buf, endTag)
+				if endIdx == -1 {
+					state.toolBuf += buf
+					buf = ""
+					continue
+				}
+
+				state.toolBuf += buf[:endIdx]
+				payload := strings.TrimSpace(state.toolBuf)
+				type toolTag struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				}
+				var t toolTag
+				if err := json.Unmarshal([]byte(payload), &t); err == nil && t.Name != "" {
+					input := "{}"
+					if len(t.Arguments) > 0 {
+						// Tabby/OpenAI often expects arguments as a JSON string.
+						var asString string
+						if err := json.Unmarshal(t.Arguments, &asString); err == nil {
+							input = asString
+						} else {
+							input = string(t.Arguments)
+						}
+					}
+					if err := emitToolCall(t.Name, input); err != nil {
+						return StepResult{}, false, err
+					}
+				} else {
+					// If parsing fails, preserve the original text.
+					if err := emitTextDelta(startTag + state.toolBuf + endTag); err != nil {
+						return StepResult{}, false, err
+					}
+				}
+
+				buf = buf[endIdx+len(endTag):]
+				state.inToolCall = false
+				state.toolBuf = ""
 			}
 
 		case StreamPartTypeTextEnd:
+			if state, ok := activeTextStreamState[part.ID]; ok {
+				// Flush any pending partial data.
+				if state.pending != "" {
+					activeTextContent[part.ID] += state.pending
+					if opts.OnTextDelta != nil {
+						if err := opts.OnTextDelta(part.ID, state.pending); err != nil {
+							return StepResult{}, false, err
+						}
+					}
+					state.pending = ""
+				}
+				if state.inToolCall {
+					remaining := "<tool_call>" + state.toolBuf
+					activeTextContent[part.ID] += remaining
+					if opts.OnTextDelta != nil {
+						if err := opts.OnTextDelta(part.ID, remaining); err != nil {
+							return StepResult{}, false, err
+						}
+					}
+				}
+				delete(activeTextStreamState, part.ID)
+			}
 			if text, exists := activeTextContent[part.ID]; exists {
 				stepContent = append(stepContent, TextContent{
 					Text:             text,
